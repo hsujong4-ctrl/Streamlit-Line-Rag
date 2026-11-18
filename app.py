@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hmac
+import logging
 import io
 import os
 import re
@@ -208,6 +209,11 @@ class RAG:
         suffix = Path(name).suffix.lower()
         if suffix not in (".pdf", ".docx"):
             raise ValueError("僅支援 PDF / DOCX")
+        # 依檔案內容（魔術位元組）驗證，不只看副檔名
+        if suffix == ".pdf" and not data[:5] == b"%PDF-":
+            raise ValueError("檔案內容不是有效的 PDF")
+        if suffix == ".docx" and not data[:2] == b"PK":
+            raise ValueError("檔案內容不是有效的 DOCX")
         src = io.BytesIO(data)
         segs = self._pdf(src) if suffix == ".pdf" else self._docx(src)
         pairs = [(c, lab) for lab, txt in segs for c in split_text(txt, CHUNK, OVERLAP)]
@@ -493,6 +499,24 @@ if "line_vault" not in ss:
     ss.line_vault = KeyVault()
 ss.setdefault("line_error", "")
 
+# 管理員狀態在腳本開頭就判定，確保側欄與主區使用一致的權限
+ss.is_admin = bool(ADMIN_PASSWORD) and bool(ss.get("admin_pw")) and \
+    hmac.compare_digest(ss.get("admin_pw").encode(), ADMIN_PASSWORD.encode())
+
+QUESTION_LIMIT, QUESTION_WINDOW = 20, 600   # 每個工作階段 10 分鐘內最多 20 次提問
+
+
+def _allow_question() -> bool:
+    now = time.time()
+    recent = [t for t in ss.get("q_times", []) if now - t < QUESTION_WINDOW]
+    if len(recent) >= QUESTION_LIMIT:
+        ss.q_times = recent
+        st.warning("提問過於頻繁，請稍後再試（每 10 分鐘最多 20 次）")
+        return False
+    recent.append(now)
+    ss.q_times = recent
+    return True
+
 
 def _store_line():
     """LINE Token 送出時：加密保存並清空輸入框。"""
@@ -532,13 +556,13 @@ with st.sidebar:
             vault.clear()
             st.rerun()
     else:
-        st.caption("未輸入則使用伺服器預設金鑰")
+        st.caption("請輸入你自己的 Groq API Key（管理員可使用伺服器金鑰）")
     st.text_input("輸入 API Key（Enter 送出後加密並清空）", type="password", key="key_input",
                   placeholder="gsk_…", on_change=_store_key,
                   help="金鑰只保存在你的工作階段記憶體中，不寫入伺服器檔案或日誌。")
     if ss.key_error:
         st.error(ss.key_error)
-    key = vault.get() or ENV_KEY
+    key = vault.get()   # 訪客只能使用自己的金鑰；伺服器金鑰僅限管理員（見提問處）
     if st.button("驗證並取得模型列表"):
         if not key:
             st.warning("尚未設定 Key")
@@ -567,7 +591,8 @@ with st.sidebar:
                     except ValueError as e:
                         ss.doc_error = str(e)
                     except Exception as e:  # noqa: BLE001
-                        ss.doc_error = f"載入失敗：{type(e).__name__}: {e}"
+                        logging.getLogger("rag_app").exception("document load failed")
+                        ss.doc_error = "載入失敗，請確認檔案未損壞且為 PDF / DOCX"
                     else:
                         if ss.doc is not None:
                             rag.release(ss.doc.sid)   # 新文件成功後才釋放舊文件
@@ -591,14 +616,14 @@ with st.sidebar:
     # LINE Bot：Token 一律可輸入（加密保存）；群發投放需管理員密碼
     st.subheader("💬 LINE Bot")
     line_vault: KeyVault = ss.line_vault
-    line_tok, auto_line = line_vault.get() or ENV_LINE, False
+    line_tok, auto_line = line_vault.get() or (ENV_LINE if ss.is_admin else ""), False
     if line_vault.has_key:
         st.success("✓ LINE Token 已加密保存於此工作階段")
         if st.button("清除 LINE Token"):
             line_vault.clear()
             st.rerun()
-    elif ENV_LINE:
-        st.caption("已使用伺服器設定的 LINE Token")
+    elif ENV_LINE and ss.is_admin:
+        st.caption("已使用伺服器設定的 LINE Token（管理員）")
     else:
         st.caption("尚未設定 LINE Token")
     st.text_input("輸入 Channel Access Token（Enter 送出後加密並清空）", type="password", key="line_input",
@@ -678,16 +703,18 @@ q = st.chat_input("輸入問題，Enter 送出", disabled=not ready)
 q = q or ss.pending
 ss.pending = None
 
-if q and ready:
+if q and ready and _allow_question():
     ss.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.markdown(q)
     with st.chat_message("assistant"):
         with st.spinner("思考中…"):
             try:
-                ans, src, timing = rag.answer(ss.doc, q, strategy, k, model, key)
+                ans, src, timing = rag.answer(ss.doc, q, strategy, k, model,
+                                                  key or (ENV_KEY if ss.is_admin else ""))
             except Exception as e:  # noqa: BLE001
-                ans, src, timing = f"✗ {type(e).__name__}: {e}", "", ""
+                logging.getLogger("rag_app").exception("answer failed")
+                ans, src, timing = "✗ 處理失敗，請稍後再試", "", ""
         st.markdown(ans)
         if timing:
             st.caption(timing)

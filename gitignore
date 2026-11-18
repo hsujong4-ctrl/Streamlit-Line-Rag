@@ -1,0 +1,9 @@
+# Streamlit 金鑰與設定
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
